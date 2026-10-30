@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from agents.blast_radius import assess_blast_radius, get_all_services
 from random import sample
 import sqlite3
 from datetime import datetime, timezone
@@ -34,6 +35,22 @@ def connect():
     return db
 
 
+def ensure_blast_radius_table(db):
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS blast_radius_assessments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id TEXT NOT NULL,
+            target_service TEXT NOT NULL,
+            affected_services TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            assessment_json TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
+
 def event(db, incident_id, agent, status, output):
     db.execute("INSERT INTO activity (incident_id, agent, status, output, created_at) VALUES (?, ?, ?, ?, ?)",
                (incident_id, agent, status, json.dumps(output), now()))
@@ -55,6 +72,15 @@ def init_db():
           agent TEXT NOT NULL, status TEXT NOT NULL, output TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS blast_radius_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id TEXT NOT NULL,
+    target_service TEXT NOT NULL,
+    affected_services TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    assessment_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
         """)
         if db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0:
             samples = [
@@ -166,6 +192,25 @@ def approve(incident_id):
                 "error": "Incident not found"
             }), 404
 
+        # Validate Blast Radius Assessment before approval
+        assessment = db.execute("""
+            SELECT id
+            FROM blast_radius_assessments
+            WHERE incident_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (incident_id,)).fetchone()
+
+        if not assessment:
+            return jsonify({
+                "ok": False,
+                "error": "Blast radius assessment required",
+                "message": (
+                    "Complete blast radius analysis "
+                    "before approving this response."
+                )
+            }), 409
+
         # Check whether already approved
         if row["approved_at"]:
             return jsonify({
@@ -207,6 +252,7 @@ def approve(incident_id):
             "simulated_only": True
         }
 
+        # Record activity event
         event(
             db,
             incident_id,
@@ -360,6 +406,145 @@ def report(incident_id):
     if not row:return jsonify({"error":"Incident not found"}),404
     item=incident_dict(row); item["activity"]=[{**dict(a),"output":json.loads(a["output"])} for a in activities]
     return jsonify(build_report(item))
+
+
+@app.post("/api/incidents/<incident_id>/blast-radius")
+def calculate_blast_radius(incident_id):
+
+    payload = request.get_json(silent=True) or {}
+
+    target_service = payload.get("target_service", "")
+
+    if not isinstance(target_service, str):
+        return jsonify({
+            "error": "Invalid target service"
+        }), 400
+
+    target_service = target_service.strip().lower()
+
+    if target_service not in get_all_services():
+        return jsonify({
+            "error": "Unknown target service",
+            "available_services": get_all_services()
+        }), 400
+
+    try:
+        result = assess_blast_radius(target_service)
+
+        with connect() as db:
+
+            # Confirm incident exists
+            incident = db.execute(
+                "SELECT id FROM incidents WHERE id = ?",
+                (incident_id,)
+            ).fetchone()
+
+            if not incident:
+                return jsonify({
+                    "error": "Incident not found"
+                }), 404
+
+            # Create table if migration has not run
+            ensure_blast_radius_table(db)
+
+            # Save assessment
+            db.execute("""
+                INSERT INTO blast_radius_assessments (
+                    incident_id,
+                    target_service,
+                    affected_services,
+                    risk_level,
+                    assessment_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                incident_id,
+                target_service,
+                json.dumps(result["affected_services"]),
+                result["risk_level"],
+                json.dumps(result)
+            ))
+
+            # Add to existing activity timeline
+            event(
+                db,
+                incident_id,
+                "Blast Radius",
+                "completed",
+                result
+            )
+
+        return jsonify({
+            "ok": True,
+            "incident_id": incident_id,
+            "assessment": result
+        })
+
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+    except Exception:
+        app.logger.exception("Blast radius assessment failed")
+        return jsonify({
+            "error": "Unable to calculate blast radius"
+        }), 500
+@app.get("/api/incidents/<incident_id>/blast-radius")
+def get_blast_radius(incident_id):
+
+    with connect() as db:
+
+        # Ensure assessment table exists
+        ensure_blast_radius_table(db)
+
+        # Retrieve latest assessment
+        row = db.execute("""
+            SELECT
+                target_service,
+                affected_services,
+                risk_level,
+                assessment_json
+            FROM blast_radius_assessments
+            WHERE incident_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (incident_id,)).fetchone()
+
+        # No assessment found
+        if not row:
+            return jsonify({
+                "ok": True,
+                "assessment": None,
+                "message": "No Blast Radius assessment found."
+            })
+
+        # Restore saved JSON
+        try:
+            assessment = json.loads(
+                row["assessment_json"] or "{}"
+            )
+        except (ValueError, TypeError):
+            assessment = {}
+
+        if not isinstance(assessment, dict):
+            assessment = {}
+
+        # Restore database values
+        assessment["target_service"] = row["target_service"]
+
+        assessment["affected_services"] = json.loads(
+            row["affected_services"] or "[]"
+        )
+
+        assessment["risk_level"] = row["risk_level"]
+
+        return jsonify({
+            "ok": True,
+            "incident_id": incident_id,
+            "assessment": assessment
+        })
+
+
+
 
 
 @app.get("/api/health")

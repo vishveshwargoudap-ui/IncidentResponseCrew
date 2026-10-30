@@ -11,6 +11,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 let incidents = [];
 let selected = null; // currently opened incident (or null)
+let blastRadiusResults = {}; // Blast Radius results, keyed by incident id
 
 /* ---------- Generic utilities ---------- */
 
@@ -92,10 +93,9 @@ async function load() {
     renderReports();
 
     const statusIncidentId = selected?.id || incidents[0]?.id;
-
-if (statusIncidentId) {
-    await refreshAgentStatuses(statusIncidentId);
-}
+    if (statusIncidentId) {
+      await refreshAgentStatuses(statusIncidentId);
+    }
 
     // Keep the open detail view in sync with fresh data
     if (selected) {
@@ -107,6 +107,26 @@ if (statusIncidentId) {
     }
   } catch (error) {
     toast(error.message);
+  }
+}
+
+/** Load the latest saved Blast Radius assessment for an incident. */
+async function loadBlastRadiusAssessment(incidentId) {
+  try {
+    const data = await api(`/api/incidents/${encodeURIComponent(incidentId)}/blast-radius`);
+
+    // Prevent an old request from updating another incident
+    if (selected?.id !== incidentId) return;
+
+    if (data.assessment) {
+      blastRadiusResults[incidentId] = data.assessment;
+    } else {
+      delete blastRadiusResults[incidentId];
+    }
+
+    renderDetail(); // display the saved assessment
+  } catch (error) {
+    console.error('Unable to load saved Blast Radius assessment:', error);
   }
 }
 
@@ -204,6 +224,9 @@ function openIncident(id) {
   showView('incident');
   renderDetail();
   window.location.hash = `incident/${id}`;
+
+  // Retrieve previously saved Blast Radius assessment
+  loadBlastRadiusAssessment(id);
 }
 
 /* Section 01 – Evidence & investigation + detection/analysis findings */
@@ -256,7 +279,7 @@ function evidencePanelHtml(i) {
 
 /* Section 02 – Triage assessment
    Reads i.triage (if the API provides it) and falls back to values
-   derived from severity / status / analysis so the panel is never empty. */
+   derived from severity / analysis so the panel is never empty. */
 const PRIORITY_BY_SEVERITY = {
   Critical: 'P1',
   High: 'P2',
@@ -270,7 +293,8 @@ function triagePanelHtml(i) {
   const analysis = (i.findings || {}).analysis || {};
 
   const priority = triage.priority || PRIORITY_BY_SEVERITY[i.severity] || 'P4';
-  const urgency = triage.urgency || (priority === 'P1' || priority === 'P2' ? 'Immediate' : 'Scheduled');
+  const urgency =
+    triage.urgency || (priority === 'P1' || priority === 'P2' ? 'Immediate' : 'Scheduled');
   const confidence = triage.confidence || analysis.confidence || 'low';
   const owner = triage.owner || 'Security on-call';
   const summary =
@@ -339,7 +363,158 @@ function fixProposalPanelHtml(i) {
     </article>`;
 }
 
-/* Section 04 – Workflow timeline */
+/* Section 04 – Blast Radius Analysis */
+
+/** SVG dependency graph: target service on top, direct dependents below. */
+function blastRadiusGraphHtml(assessment) {
+  if (!assessment) return '';
+
+  const target = assessment.target_service || 'Unknown';
+  const dependents = assessment.direct_dependents || [];
+  const affected = assessment.affected_services || [];
+
+  const width = 600;
+  const rowHeight = 65;
+  const height = Math.max(180, 120 + dependents.length * rowHeight);
+
+  const centerX = 300;
+  const targetY = 45;
+  const targetWidth = 230;
+  const nodeWidth = 230;
+
+  let nodes = '';
+  let edges = '';
+
+  dependents.forEach((service, index) => {
+    const y = 125 + index * rowHeight;
+
+    edges += `
+      <line
+        x1="${centerX}"
+        y1="${targetY + 25}"
+        x2="${centerX}"
+        y2="${y}"
+        stroke="#38bdf8"
+        stroke-width="2"
+        stroke-dasharray="5 4"
+      />`;
+
+    nodes += `
+      <rect
+        x="${centerX - nodeWidth / 2}"
+        y="${y}"
+        width="${nodeWidth}"
+        height="38"
+        rx="8"
+        fill="#123c55"
+        stroke="#38bdf8"
+      />
+      <text
+        x="${centerX}"
+        y="${y + 24}"
+        fill="#ffffff"
+        text-anchor="middle"
+        font-size="13"
+      >${safe(service)}</text>`;
+  });
+
+  return `
+    <div class="finding-box blast-graph">
+      <div class="finding-label">SERVICE DEPENDENCY GRAPH</div>
+
+      <svg
+        viewBox="0 0 ${width} ${height}"
+        width="100%"
+        role="img"
+        aria-label="Blast radius service dependency graph"
+      >
+        <rect
+          x="${centerX - targetWidth / 2}"
+          y="${targetY}"
+          width="${targetWidth}"
+          height="42"
+          rx="8"
+          fill="#164e63"
+          stroke="#22d3ee"
+          stroke-width="2"
+        />
+        <text
+          x="${centerX}"
+          y="${targetY + 26}"
+          fill="#ffffff"
+          text-anchor="middle"
+          font-size="14"
+          font-weight="bold"
+        >${safe(target)}</text>
+
+        ${edges}
+        ${nodes}
+      </svg>
+
+      <p>Direct dependents: ${dependents.length}</p>
+      <p>Total affected services: ${affected.length}</p>
+      <small>Simulation only. No infrastructure changes executed.</small>
+    </div>`;
+}
+
+function blastRadiusPanelHtml(i) {
+  const assessment = blastRadiusResults[i.id];
+
+  const services = [
+    'authentication-service',
+    'admin-portal',
+    'finance-api',
+    'user-dashboard',
+    'notification-service',
+  ];
+
+  let resultHtml = '';
+
+  if (assessment) {
+    const affected = assessment.affected_services || [];
+
+    resultHtml = `
+      <div class="finding-box">
+        <div class="finding-label">BLAST RADIUS RESULT</div>
+        <strong>Risk Level: ${safe(assessment.risk_level || 'Unknown')}</strong>
+        <p>Target: ${safe(assessment.target_service || 'Unknown')}</p>
+        <p>Affected Services (${affected.length})</p>
+        <ul>${affected.map((service) => `<li>${safe(service)}</li>`).join('')}</ul>
+        <small>Simulation only. No infrastructure changes executed.</small>
+      </div>`;
+  }
+
+  const optionsHtml = services
+    .map((service) => `<option value="${safe(service)}">${safe(service)}</option>`)
+    .join('');
+
+  return `
+    <article class="panel blast-radius-panel">
+      <div class="panel-heading">
+        <div><span class="panel-index">04</span><h2>Blast Radius Analysis</h2></div>
+        <span class="mini-tag">SIMULATION ONLY</span>
+      </div>
+
+      <p class="panel-copy">
+        Identify dependent services and estimate the potential impact of an incident.
+      </p>
+
+      <label class="field-label" for="blastRadiusTarget">Select target service</label>
+      <select id="blastRadiusTarget">
+        <option value="">Choose a service</option>
+        ${optionsHtml}
+      </select>
+
+      <button class="button primary full" id="runBlastRadius" type="button">
+        Run Blast Radius Analysis →
+      </button>
+
+      <div id="blastRadiusResult">${resultHtml}</div>
+      ${blastRadiusGraphHtml(assessment)}
+    </article>`;
+}
+
+/* Section 05 – Workflow timeline */
 function timelinePanelHtml(i) {
   const itemsHtml = i.timeline
     .map(
@@ -358,13 +533,13 @@ function timelinePanelHtml(i) {
   return `
     <article class="panel">
       <div class="panel-heading">
-        <div><span class="panel-index">04</span><h2>Workflow timeline</h2></div>
+        <div><span class="panel-index">05</span><h2>Workflow timeline</h2></div>
       </div>
       <div class="timeline">${itemsHtml}</div>
     </article>`;
 }
 
-/* Section 05 – Response plan (approval) */
+/* Section 06 – Response plan (approval) */
 function responsePanelHtml(i) {
   const actions = i.actions || {};
   const approved = Boolean(i.approved_at);
@@ -390,7 +565,7 @@ function responsePanelHtml(i) {
   return `
     <article class="panel response-panel">
       <div class="panel-heading">
-        <div><span class="panel-index">05</span><h2>Response plan</h2></div>
+        <div><span class="panel-index">06</span><h2>Response plan</h2></div>
       </div>
 
       <div class="approval-banner ${approved ? 'approved' : ''}">
@@ -407,7 +582,7 @@ function responsePanelHtml(i) {
     </article>`;
 }
 
-/* Section 06 – Verification */
+/* Section 07 – Verification */
 function verificationPanelHtml(i) {
   const approved = Boolean(i.approved_at);
 
@@ -421,7 +596,7 @@ function verificationPanelHtml(i) {
   return `
     <article class="panel verification-panel">
       <div class="panel-heading">
-        <div><span class="panel-index">06</span><h2>Verify response</h2></div>
+        <div><span class="panel-index">07</span><h2>Verify response</h2></div>
       </div>
       <p class="panel-copy">Provide follow-up sample events to assess whether matching source activity continues.</p>
 
@@ -470,6 +645,7 @@ function renderDetail() {
         ${evidencePanelHtml(i)}
         ${triagePanelHtml(i)}
         ${fixProposalPanelHtml(i)}
+        ${blastRadiusPanelHtml(i)}
         ${timelinePanelHtml(i)}
       </div>
       <aside class="detail-side">
@@ -483,6 +659,7 @@ function renderDetail() {
 
 /** Attach click handlers to the buttons inside the detail view. */
 function bindDetailActions(i) {
+  // Approve simulated response
   $('#approveAction')?.addEventListener('click', async () => {
     try {
       await api(`/api/incidents/${i.id}/approve`, { method: 'POST', body: '{}' });
@@ -493,6 +670,45 @@ function bindDetailActions(i) {
     }
   });
 
+  // Run Blast Radius Analysis
+  $('#runBlastRadius')?.addEventListener('click', async () => {
+    const button = $('#runBlastRadius');
+    const targetService = $('#blastRadiusTarget').value;
+
+    if (!targetService) {
+      toast('Please select a target service.');
+      return;
+    }
+
+    try {
+      button.disabled = true;
+      button.textContent = 'Calculating blast radius...';
+
+      const data = await api(`/api/incidents/${i.id}/blast-radius`, {
+        method: 'POST',
+        body: JSON.stringify({ target_service: targetService }),
+      });
+
+      if (!data.ok || !data.assessment) {
+        throw new Error('Blast Radius assessment was not returned.');
+      }
+
+      // Store result for this incident
+      blastRadiusResults[i.id] = {
+        ...data.assessment,
+        target_service: targetService,
+      };
+
+      toast('Blast Radius Analysis completed successfully.');
+      renderDetail(); // re-render to show result + graph
+    } catch (error) {
+      toast(error.message);
+      button.disabled = false;
+      button.textContent = 'Run Blast Radius Analysis →';
+    }
+  });
+
+  // Run verification
   $('#verifyAction')?.addEventListener('click', async () => {
     try {
       const events = JSON.parse($('#followupEvents').value);
@@ -509,6 +725,7 @@ function bindDetailActions(i) {
     }
   });
 
+  // Export report
   $('#detailReport')?.addEventListener('click', () => showReport(i.id));
 }
 
@@ -531,12 +748,9 @@ function renderCrew() {
         <article class="crew-card">
           <div class="crew-top">
             <span class="crew-icon">${icon}</span>
-           <span
-    class="agent-state ${state}"
-    data-agent-status="${name}"
->
-    <i></i>${state.replaceAll('_', ' ')}
-</span>
+            <span class="agent-state ${state}" data-agent-status="${name}">
+              <i></i>${state.replaceAll('_', ' ')}
+            </span>
           </div>
           <h3>${name} Agent</h3>
           <p>${description}</p>
@@ -544,6 +758,26 @@ function renderCrew() {
         </article>`
     )
     .join('');
+}
+
+/** Fetch live agent statuses for an incident and update the crew cards. */
+async function refreshAgentStatuses(incidentId) {
+  try {
+    const response = await fetch(`/api/incidents/${incidentId}/agent-statuses`);
+    if (!response.ok) throw new Error('Unable to fetch agent statuses');
+
+    const data = await response.json();
+
+    Object.entries(data.agents).forEach(([agent, status]) => {
+      const element = $(`[data-agent-status="${agent}"]`);
+      if (!element) return;
+
+      element.className = `agent-state ${status.toLowerCase().replaceAll(' ', '-')}`;
+      element.innerHTML = `<i></i>${safe(status)}`;
+    });
+  } catch (error) {
+    console.error('Agent status update failed:', error);
+  }
 }
 
 /* ---------- Reports view ---------- */
@@ -684,39 +918,6 @@ $('#downloadReport').addEventListener('click', () => {
   link.click();
   URL.revokeObjectURL(link.href);
 });
-async function refreshAgentStatuses(incidentId) {
-    try {
-        const response = await fetch(
-            `/api/incidents/${incidentId}/agent-statuses`
-        );
-
-        if (!response.ok) {
-            throw new Error("Unable to fetch agent statuses");
-        }
-
-        const data = await response.json();
-
-        Object.entries(data.agents).forEach(([agent, status]) => {
-
-            const element = document.querySelector(
-                `[data-agent-status="${agent}"]`
-            );
-
-            if (!element) return;
-
-            element.className = `agent-state ${
-                status.toLowerCase().replaceAll(" ", "-")
-            }`;
-
-            element.innerHTML = `
-                <i></i>${status}
-            `;
-        });
-
-    } catch (error) {
-        console.error("Agent status update failed:", error);
-    }
-}
 
 /* ---------- Start ---------- */
 
