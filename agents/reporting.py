@@ -1,0 +1,3 @@
+"""Build an exportable incident report from persisted workflow outputs."""
+def build_report(incident):
+    return {"title":f"Incident report — {incident['id']}","mode":"SIMULATED SAMPLE DATA","incident":{k:incident.get(k) for k in ("id","title","description","incident_type","severity","status","source","asset","created_at")},"evidence":incident.get("evidence",[]),"findings":incident.get("findings",{}),"recommended_actions":incident.get("actions",{}),"approved_at":incident.get("approved_at"),"verification":incident.get("verification"),"timeline":incident.get("timeline",[]),"agent_activity":incident.get("activity",[]),"outcome_note":"A resolved status is shown only when the verification agent found no matching activity in supplied follow-up sample events."}
