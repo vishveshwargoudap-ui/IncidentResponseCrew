@@ -365,93 +365,129 @@ function fixProposalPanelHtml(i) {
 
 /* Section 04 – Blast Radius Analysis */
 
-/** SVG dependency graph: target service on top, direct dependents below. */
+/** SVG dependency graph: target service above dependents grouped by impact level. */
 function blastRadiusGraphHtml(assessment) {
   if (!assessment) return '';
 
   const target = assessment.target_service || 'Unknown';
-  const dependents = assessment.direct_dependents || [];
   const affected = assessment.affected_services || [];
-
-  const width = 600;
+  const directDependents = assessment.direct_dependents || [];
+  const serviceLevels = assessment.service_levels || {};
+  const levels = new Map(affected.map((service) => {
+    const level = Number(serviceLevels[service]);
+    return [service, Number.isInteger(level) && level > 0 ? level : 1];
+  }));
+  const maxLevel = Math.max(0, ...levels.values());
+  const groups = new Map();
+  levels.forEach((level, service) => {
+    if (!groups.has(level)) groups.set(level, []);
+    groups.get(level).push(service);
+  });
+  const maxNodesInLevel = Math.max(1, ...Array.from(groups.values(), (group) => group.length));
   const rowHeight = 65;
-  const height = Math.max(180, 120 + dependents.length * rowHeight);
-
-  const centerX = 300;
+  const nodeWidth = 230;
+  const nodeHeight = 38;
+  const nodeGap = 20;
+  const width = Math.max(600, maxNodesInLevel * (nodeWidth + nodeGap) + 40);
+  const height = Math.max(180, 120 + maxLevel * rowHeight);
+  const centerX = width / 2;
   const targetY = 45;
   const targetWidth = 230;
-  const nodeWidth = 230;
+  const positions = new Map([[target, { x: centerX, y: targetY, height: 42 }]]);
 
   let nodes = '';
   let edges = '';
 
-  dependents.forEach((service, index) => {
-    const y = 125 + index * rowHeight;
+  groups.forEach((services, level) => {
+    const groupWidth = services.length * nodeWidth + (services.length - 1) * nodeGap;
+    const startX = centerX - groupWidth / 2 + nodeWidth / 2;
+    const y = 125 + (level - 1) * rowHeight;
+
+    services.forEach((service, index) => {
+      const x = startX + index * (nodeWidth + nodeGap);
+      positions.set(service, { x, y, height: nodeHeight });
+      const color = level === 1
+        ? { fill: '#44351d', stroke: '#f4b65e' }
+        : { fill: '#123c55', stroke: '#60a5fa' };
+
+      nodes += `
+        <rect
+          x="${x - nodeWidth / 2}"
+          y="${y}"
+          width="${nodeWidth}"
+          height="${nodeHeight}"
+          rx="8"
+          fill="${color.fill}"
+          stroke="${color.stroke}"
+        />
+        <text
+          x="${x}"
+          y="${y + 24}"
+          fill="#ffffff"
+          text-anchor="middle"
+          font-size="13"
+        >${safe(service)}</text>`;
+    });
+  });
+
+  const graphEdges = assessment.graph_edges || directDependents.map((service) => ({
+    from: target,
+    to: service,
+  }));
+  graphEdges.forEach((edge) => {
+    const from = positions.get(edge.from);
+    const to = positions.get(edge.to);
+    if (!from || !to) return;
 
     edges += `
       <line
-        x1="${centerX}"
-        y1="${targetY + 25}"
-        x2="${centerX}"
-        y2="${y}"
-        stroke="#38bdf8"
+        x1="${from.x}"
+        y1="${from.y + from.height}"
+        x2="${to.x}"
+        y2="${to.y}"
+        stroke="#78879b"
         stroke-width="2"
         stroke-dasharray="5 4"
       />`;
-
-    nodes += `
-      <rect
-        x="${centerX - nodeWidth / 2}"
-        y="${y}"
-        width="${nodeWidth}"
-        height="38"
-        rx="8"
-        fill="#123c55"
-        stroke="#38bdf8"
-      />
-      <text
-        x="${centerX}"
-        y="${y + 24}"
-        fill="#ffffff"
-        text-anchor="middle"
-        font-size="13"
-      >${safe(service)}</text>`;
   });
 
   return `
     <div class="finding-box blast-graph">
       <div class="finding-label">SERVICE DEPENDENCY GRAPH</div>
 
-      <svg
-        viewBox="0 0 ${width} ${height}"
-        width="100%"
-        role="img"
-        aria-label="Blast radius service dependency graph"
-      >
-        <rect
-          x="${centerX - targetWidth / 2}"
-          y="${targetY}"
-          width="${targetWidth}"
-          height="42"
-          rx="8"
-          fill="#164e63"
-          stroke="#22d3ee"
-          stroke-width="2"
-        />
-        <text
-          x="${centerX}"
-          y="${targetY + 26}"
-          fill="#ffffff"
-          text-anchor="middle"
-          font-size="14"
-          font-weight="bold"
-        >${safe(target)}</text>
+      <div class="blast-graph-wrapper">
+        <svg
+          viewBox="0 0 ${width} ${height}"
+          width="${width}"
+          height="${height}"
+          role="img"
+          aria-label="Blast radius service dependency graph"
+        >
+          <rect
+            x="${centerX - targetWidth / 2}"
+            y="${targetY}"
+            width="${targetWidth}"
+            height="42"
+            rx="8"
+            fill="#123c2a"
+            stroke="#46d3a2"
+            stroke-width="2"
+          />
+          <text
+            x="${centerX}"
+            y="${targetY + 26}"
+            fill="#ffffff"
+            text-anchor="middle"
+            font-size="14"
+            font-weight="bold"
+          >${safe(target)}</text>
 
-        ${edges}
-        ${nodes}
-      </svg>
+          ${edges}
+          ${nodes}
+        </svg>
+      </div>
 
-      <p>Direct dependents: ${dependents.length}</p>
+      <p>Direct dependents: ${directDependents.length}</p>
       <p>Total affected services: ${affected.length}</p>
       <small>Simulation only. No infrastructure changes executed.</small>
     </div>`;
@@ -471,18 +507,63 @@ function blastRadiusPanelHtml(i) {
   let resultHtml = '';
 
   if (assessment) {
+
     const affected = assessment.affected_services || [];
 
+    const risk = assessment.risk_level || "Unknown";
+
     resultHtml = `
-      <div class="finding-box">
-        <div class="finding-label">BLAST RADIUS RESULT</div>
-        <strong>Risk Level: ${safe(assessment.risk_level || 'Unknown')}</strong>
-        <p>Target: ${safe(assessment.target_service || 'Unknown')}</p>
-        <p>Affected Services (${affected.length})</p>
-        <ul>${affected.map((service) => `<li>${safe(service)}</li>`).join('')}</ul>
-        <small>Simulation only. No infrastructure changes executed.</small>
-      </div>`;
-  }
+        <div class="finding-box">
+
+            <div class="finding-label">
+                BLAST RADIUS RESULT
+            </div>
+
+            <h3 class="risk-${risk.toLowerCase()}">
+                Risk Level: ${safe(risk)}
+            </h3>
+
+            <p>
+                Target Service:
+                <strong>
+                    ${safe(assessment.target_service)}
+                </strong>
+            </p>
+
+            <p>
+                Total Affected Services:
+                <strong>${affected.length}</strong>
+            </p>
+
+            <div class="blast-legend">
+                <span class="blast-legend-item"><i class="blast-legend-swatch target" aria-hidden="true"></i>Target service</span>
+                <span class="blast-legend-item"><i class="blast-legend-swatch direct" aria-hidden="true"></i>Direct impact</span>
+                <span class="blast-legend-item"><i class="blast-legend-swatch indirect" aria-hidden="true"></i>Indirect impact</span>
+            </div>
+
+            <h3>Service Dependency Graph</h3>
+
+            ${blastRadiusGraphHtml(assessment)}
+
+            <h3>Affected Services</h3>
+
+            <ul>
+                ${affected.map(service =>
+                    `<li>${safe(service)}</li>`
+                ).join("")}
+            </ul>
+
+            <p>
+                ${safe(assessment.recommendation || "")}
+            </p>
+
+            <small>
+                Simulation only. No infrastructure changes executed.
+            </small>
+
+        </div>
+    `;
+}
 
   const optionsHtml = services
     .map((service) => `<option value="${safe(service)}">${safe(service)}</option>`)
@@ -510,7 +591,7 @@ function blastRadiusPanelHtml(i) {
       </button>
 
       <div id="blastRadiusResult">${resultHtml}</div>
-      ${blastRadiusGraphHtml(assessment)}
+
     </article>`;
 }
 

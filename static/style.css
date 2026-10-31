@@ -156,3 +156,81 @@
     font-size: 12px;
     margin-top: 15px;
 }
+
+/* Blast Radius Graph */
+
+.blast-graph-wrapper {
+    width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    margin: 20px 0;
+    padding: 15px 0;
+    border-radius: 12px;
+    background: rgba(10, 25, 45, 0.55);
+}
+
+.blast-graph-wrapper svg {
+    display: block;
+    max-width: none;
+}
+
+.blast-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 15px;
+    margin: 15px 0;
+    font-size: 12px;
+}
+
+.blast-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    color: #a9b7cc;
+}
+
+.blast-legend-swatch {
+    width: 10px;
+    height: 10px;
+    border: 2px solid;
+    border-radius: 3px;
+}
+
+.blast-legend-swatch.target {
+    background: #123c2a;
+    border-color: #46d3a2;
+}
+
+.blast-legend-swatch.direct {
+    background: #44351d;
+    border-color: #f4b65e;
+}
+
+.blast-legend-swatch.indirect {
+    background: #123c55;
+    border-color: #60a5fa;
+}
+
+.blast-radius-panel .finding-box {
+    margin-top: 18px;
+    padding: 18px;
+    border: 1px solid rgba(100, 150, 200, 0.3);
+    border-radius: 12px;
+}
+
+.risk-critical {
+    color: #ef4444;
+}
+
+.risk-high {
+    color: #f97316;
+}
+
+.risk-low {
+    color: #eab308;
+}
+
+.risk-none {
+    color: #22c55e;
+}

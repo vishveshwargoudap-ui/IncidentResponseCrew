@@ -1,6 +1,7 @@
 """Flask API and UI for the simulated Incident Response Crew MVP."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from agents.blast_radius import assess_blast_radius, get_all_services
 from random import sample
@@ -18,6 +19,7 @@ from agents.response import recommend
 from agents.verification import verify
 from agents.triage import triage
 from agents.fix_proposal import propose_fixes
+from agents.self_cause import detect_self_caused_incident
 
 BASE = Path(__file__).resolve().parent
 DB = BASE / "data" / "incidents.db"
@@ -28,12 +30,29 @@ app.config["JSON_SORT_KEYS"] = False
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-
+@contextmanager
 def connect():
-    db = sqlite3.connect(DB)
-    db.row_factory = sqlite3.Row
-    return db
+    db = sqlite3.connect(
+        DB,
+        timeout=20,
+        check_same_thread=False
+    )
 
+    db.row_factory = sqlite3.Row
+
+    try:
+        db.execute("PRAGMA busy_timeout = 20000")
+
+        yield db
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
 
 def ensure_blast_radius_table(db):
 
@@ -48,14 +67,159 @@ def ensure_blast_radius_table(db):
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+def enable_sqlite_wal():
 
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DB, timeout=20)
+
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.commit()
+    finally:
+        db.close()
 
 
 def event(db, incident_id, agent, status, output):
     db.execute("INSERT INTO activity (incident_id, agent, status, output, created_at) VALUES (?, ?, ?, ?, ?)",
                (incident_id, agent, status, json.dumps(output), now()))
 
+def json_value(value, fallback=None):
+    try:
+        return json.loads(value) if value else fallback
+    except (ValueError, TypeError):
+        return fallback
 
+
+def approved_action_items(value):
+    """
+    Extract action records from the existing response recommendation.
+    """
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, dict):
+        for key in ("actions", "recommendations", "proposals", "steps"):
+            if isinstance(value.get(key), list):
+                return value[key]
+
+        return [value]
+
+    if isinstance(value, str) and value.strip():
+        return [value]
+
+    return []
+
+
+def run_self_cause_detection(db, new_incident_id):
+
+    new_row = db.execute(
+        "SELECT * FROM incidents WHERE id = ?",
+        (new_incident_id,)
+    ).fetchone()
+
+    if not new_row:
+        return None
+
+    new_incident = dict(new_row)
+
+    new_incident["events"] = json_value(
+        new_incident.get("evidence"), []
+    )
+
+    prior_rows = db.execute("""
+        SELECT *
+        FROM incidents
+        WHERE id != ?
+          AND approved_at IS NOT NULL
+        ORDER BY approved_at DESC
+    """, (new_incident_id,)).fetchall()
+
+    prior_incidents = []
+
+    for prior_row in prior_rows:
+
+        prior = dict(prior_row)
+
+        prior["actions"] = json_value(
+            prior.get("actions"), []
+        )
+
+        # Retrieve the original agent activity.
+        activities = db.execute("""
+            SELECT agent, status, output, created_at
+            FROM activity
+            WHERE incident_id = ?
+            ORDER BY id
+        """, (prior["id"],)).fetchall()
+
+        prior["activity"] = []
+
+        for activity in activities:
+            activity_item = dict(activity)
+            activity_item["output"] = json_value(
+                activity_item["output"], {}
+            )
+            prior["activity"].append(activity_item)
+
+        # Retrieve the latest blast-radius assessment.
+        assessment_row = db.execute("""
+            SELECT assessment_json
+            FROM blast_radius_assessments
+            WHERE incident_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (prior["id"],)).fetchone()
+
+        if assessment_row:
+            prior["blast_radius_assessment"] = json_value(
+                assessment_row["assessment_json"], {}
+            )
+
+        prior_incidents.append(prior)
+
+    # Run the detector.
+    result = detect_self_caused_incident(
+        new_incident=new_incident,
+        prior_incidents=prior_incidents,
+        correlation_window_seconds=300
+    )
+
+    # Save the detection result in the existing activity table.
+    activity_status = (
+        "review_required"
+        if result.get("requires_human_review")
+        else "completed"
+    )
+
+    event(
+        db,
+        new_incident_id,
+        "Self-Cause Detector",
+        activity_status,
+        result
+    )
+
+    # Add the result to the incident timeline.
+    timeline = json_value(
+        new_incident.get("timeline"), []
+    )
+
+    timeline.append({
+        "at": now(),
+        "label": "Self-Cause Detection",
+        "detail": result.get("explanation", "Detection completed.")
+    })
+
+    db.execute("""
+        UPDATE incidents
+        SET timeline = ?
+        WHERE id = ?
+    """, (
+        json.dumps(timeline),
+        new_incident_id
+    ))
+
+    return result
 def init_db():
     DB.parent.mkdir(exist_ok=True)
     with connect() as db:
@@ -136,6 +300,47 @@ def incident(incident_id):
     if not row: return jsonify({"error":"Incident not found"}), 404
     return jsonify(incident_dict(row))
 
+@app.get("/api/incidents/<incident_id>/self-cause")
+def get_self_cause_result(incident_id):
+
+    with connect() as db:
+
+        incident = db.execute(
+            "SELECT id FROM incidents WHERE id = ?",
+            (incident_id,)
+        ).fetchone()
+
+        if not incident:
+            return jsonify({
+                "error": "Incident not found"
+            }), 404
+
+        record = db.execute("""
+            SELECT status, output, created_at
+            FROM activity
+            WHERE incident_id = ?
+              AND agent = 'Self-Cause Detector'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (incident_id,)).fetchone()
+
+        if not record:
+            return jsonify({
+                "ok": True,
+                "status": "not_run",
+                "message": "Self-Cause Detection has not run for this incident."
+            })
+
+        result = json_value(record["output"], {})
+
+        return jsonify({
+            "ok": True,
+            "incident_id": incident_id,
+            "agent_status": record["status"],
+            "result": result,
+            "created_at": record["created_at"]
+        })
+
 
 @app.post("/api/incidents")
 def create_incident():
@@ -173,6 +378,8 @@ def create_incident():
         db.execute("INSERT INTO incidents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)", (iid,title,sample["description"],analysis["incident_type"],analysis["severity"],"Active",source,asset,created,json.dumps(events[:100]),json.dumps({"detection":detection,"investigation":findings,"triage":triage_result,"fix_proposals":fixes,"analysis":analysis}),json.dumps(actions),json.dumps(timeline)))
         for name, output in (("Detection",detection),("Investigation",findings),("Analysis",analysis),("Triage",triage_result),("FixProposal",fixes),("Response",actions)):
             event(db,iid,name,"waiting_approval" if name=="Response" else "completed",output)
+        # Step 7: correlate the new incident with previously approved actions.
+        run_self_cause_detection(db, iid)
     return jsonify({"id":iid}), 201
 
 
@@ -220,6 +427,9 @@ def approve(incident_id):
                 "message": "Response was already approved."
             })
 
+        recommended_actions = json_value(row["actions"], [])
+        approved_actions = approved_action_items(recommended_actions)
+
         # Record approval time
         approval_time = now()
 
@@ -244,22 +454,17 @@ def approve(incident_id):
             incident_id
         ))
 
-        # Update Response Agent execution status
         response_result = {
             "status": "Completed",
             "result": "Simulated approval recorded",
             "approved_at": approval_time,
+            "actions": approved_actions,
+            "approved_action": approved_actions,
             "simulated_only": True
         }
 
-        # Record activity event
-        event(
-            db,
-            incident_id,
-            "Response",
-            "completed",
-            response_result
-        )
+        # Keep the approved recommendations and any explicit service target.
+        event(db, incident_id, "Response", "completed", response_result)
 
     return jsonify({
         "ok": True,
@@ -551,5 +756,6 @@ def get_blast_radius(incident_id):
 def health(): return jsonify({"status":"ok","mode":"simulated demo"})
 
 
+enable_sqlite_wal()
 init_db()
 if __name__ == "__main__": app.run(debug=True)

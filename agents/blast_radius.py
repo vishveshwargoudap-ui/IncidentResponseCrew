@@ -30,6 +30,7 @@ def get_all_services():
     return list(SERVICE_DEPENDENCIES.keys())
 
 
+
 def assess_blast_radius(target_service):
 
     target_service = target_service.strip().lower()
@@ -37,45 +38,53 @@ def assess_blast_radius(target_service):
     if target_service not in SERVICE_DEPENDENCIES:
         raise ValueError("Unknown target service")
 
-    # Find services that depend directly or indirectly
-    # on the target service.
-
+    # Track affected services and dependency levels
     affected = set()
-    queue = [target_service]
+    visited = {target_service}
+    queue = [(target_service, 0)]
 
+    service_levels = {}
+    graph_edges = []
+
+    # Traverse direct and indirect dependents
     while queue:
 
-        current = queue.pop(0)
+        current, level = queue.pop(0)
 
         for service, dependencies in SERVICE_DEPENDENCIES.items():
 
-            if (
-                current in dependencies
-                and service not in affected
-            ):
-                affected.add(service)
-                queue.append(service)
+            if current in dependencies:
 
-    
-# Identify direct dependents
+                # Store dependency connection
+                edge = {
+                    "from": current,
+                    "to": service
+                }
+
+                if edge not in graph_edges:
+                    graph_edges.append(edge)
+
+                if service not in visited:
+
+                    visited.add(service)
+                    affected.add(service)
+
+                    service_levels[service] = level + 1
+
+                    queue.append((service, level + 1))
+
+    # Direct dependents
     direct_dependents = sorted([
         service
         for service, dependencies in SERVICE_DEPENDENCIES.items()
         if target_service in dependencies
     ])
 
-# Services affected directly or indirectly
     impacted = sorted(affected)
 
-# Identify indirect dependents
-    indirect_dependents = sorted(
-        set(impacted) - set(direct_dependents)
-    )
-
-# Count affected services
     count = len(impacted)
 
-    # Risk classification for demonstration.
+    # Risk classification
     if count >= 4:
         risk = "Critical"
     elif count >= 2:
@@ -89,8 +98,9 @@ def assess_blast_radius(target_service):
         "target_service": target_service,
         "affected_services": impacted,
         "direct_dependents": direct_dependents,
-        "indirect_dependents": indirect_dependents,
         "direct_dependencies": SERVICE_DEPENDENCIES[target_service],
+        "service_levels": service_levels,
+        "graph_edges": graph_edges,
         "total_affected": count,
         "risk_level": risk,
         "simulation_only": True,

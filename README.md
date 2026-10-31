@@ -36,12 +36,14 @@ Open <http://127.0.0.1:5000>. SQLite data is initialized in `data/incidents.db` 
 - `POST /api/incidents/<id>/verify` — evaluate `{"events": [...]}` follow-up events after approval.
 - `GET /api/incidents/<id>/report` — report data as JSON.
 
+`agents.self_cause.detect_self_caused_incident(new_incident, prior_incidents)` correlates each newly created incident with prior approvals using a five-minute window, affected service, blast-radius membership, and a service-targeted approved action. Results are logged in the new incident's activity and are available from `GET /api/incidents/<id>/self-cause`. A match is a possible causal link requiring human review and reconstruction; it does not prove that the action caused the failure. Service-specific recommendations should include an explicit `target_service`; source-only recommendations are not assigned a fabricated service target.
+
 Agent response fields are structured Python dictionaries persisted as JSON. Detection and classification use transparent local rules rather than an LLM. No live log source, threat intelligence, or external containment integration is configured.
 
 ## Project structure
 
 - `app.py` — Flask routes, SQLite initialization, and workflow persistence.
-- `agents/` — detection, investigation, analysis, response, verification, and reporting modules.
+- `agents/` — detection, investigation, analysis, response, self-cause correlation, verification, and reporting modules.
 - `data/` — generated local SQLite database; `incidents.json` is retained as a legacy empty scaffold.
 - `templates/index.html`, `static/` — responsive single page SOC dashboard.
 - `simulator/` — existing simulator scaffold.
