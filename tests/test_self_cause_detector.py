@@ -146,15 +146,11 @@ def test_incident_creation_logs_possible_link_without_approving_response(
     assert original_response.status_code == 201
     original_id = original_response.get_json()["id"]
 
-    # Approval is still blocked until the incident has a blast-radius review.
-    assert client.post(f"/api/incidents/{original_id}/approve").status_code == 409
-
-    blast_radius_response = client.post(
-        f"/api/incidents/{original_id}/blast-radius",
-        json={"target_service": "authentication-service"},
-    )
-    assert blast_radius_response.status_code == 200
-
+    detail = client.get(f"/api/incidents/{original_id}").get_json()
+    assert all(action["impact_assessment"]["status"] == "complete"
+               for action in detail["actions"]["actions"])
+    assert any(action["target_service"] == "authentication-service"
+               for action in detail["actions"]["actions"])
     assert client.post(f"/api/incidents/{original_id}/approve").status_code == 200
 
     with app_module.connect() as db:
@@ -173,7 +169,7 @@ def test_incident_creation_logs_possible_link_without_approving_response(
         for action in approved_record["approved_action"]
         if action.get("target_service") == "authentication-service"
     )
-    assert service_action["action"] == "Temporarily restrict authentication-service"
+    assert service_action["impact_assessment"]["target_service"] == "authentication-service"
 
     new_response = client.post(
         "/api/incidents",
@@ -221,3 +217,43 @@ def test_incident_creation_logs_possible_link_without_approving_response(
     assert new_incident["approved_at"] is None
     assert detector_activity["status"] == "review_required"
     assert pending_response["status"] == "waiting_approval"
+
+
+def test_unknown_target_assessment_blocks_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "DB", tmp_path / "incidents.db")
+    app_module.enable_sqlite_wal()
+    app_module.init_db()
+    with app_module.connect() as db:
+        row = db.execute("SELECT id, actions FROM incidents LIMIT 1").fetchone()
+        actions = json.loads(row["actions"])
+        actions["actions"][0]["impact_assessment"] = {
+            "status": "incomplete", "risk_level": "Unknown"
+        }
+        db.execute("UPDATE incidents SET actions = ? WHERE id = ?",
+                   (json.dumps(actions), row["id"]))
+    response = app_module.app.test_client().post(f"/api/incidents/{row['id']}/approve")
+    assert response.status_code == 409
+    assert "impact assessment" in response.get_json()["error"].lower()
+
+
+def test_possible_link_includes_recovery_recommendation_and_report(monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "DB", tmp_path / "incidents.db")
+    app_module.enable_sqlite_wal()
+    app_module.init_db()
+    client = app_module.app.test_client()
+    original = client.post("/api/incidents", json={
+        "title": "Brute Force Attack", "asset": "admin-portal",
+        "events": [{"type": "login_failed"} for _ in range(3)]
+    }).get_json()["id"]
+    assert client.post(f"/api/incidents/{original}/approve").status_code == 200
+    subsequent = client.post("/api/incidents", json={
+        "title": "Finance API Failure", "asset": "finance-api",
+        "events": [{"type": "service_failure", "service": "finance-api"}]
+    }).get_json()["id"]
+    result = client.get(f"/api/incidents/{subsequent}/self-cause").get_json()["result"]
+    assert result["causal_chain"]["status"] == "possible causal relationship"
+    assert result["recovery_recommendation"]["status"] == "pending_human_approval"
+    assert client.get(f"/api/incidents/{subsequent}/report").get_json()["causal_chain"]
+    recovery = client.post(f"/api/incidents/{subsequent}/recovery/approve")
+    assert recovery.status_code == 200
+    assert "no rollback was executed" in recovery.get_json()["message"]

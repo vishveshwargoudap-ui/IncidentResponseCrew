@@ -12,6 +12,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 let incidents = [];
 let selected = null; // currently opened incident (or null)
 let blastRadiusResults = {}; // Blast Radius results, keyed by incident id
+let causalResults = {};
 
 /* ---------- Generic utilities ---------- */
 
@@ -202,7 +203,10 @@ function incidentRowHtml(i) {
         <span class="status ${statusClass(i.status)}"><i></i>${safe(i.status)}</span>
       </td>
       <td class="time-cell">${timeAgo(i.created_at)}</td>
-      <td><button class="row-arrow" aria-label="Open incident">→</button></td>
+      <td class="incident-row-actions">
+        <button class="row-arrow" aria-label="Open incident">→</button>
+        <button class="row-delete" type="button" aria-label="Delete incident ${safe(i.id)}" title="Delete incident">&#128465;</button>
+      </td>
     </tr>`;
 }
 
@@ -634,6 +638,7 @@ function responsePanelHtml(i) {
             <strong>${safe(x.action)}</strong>
             <p>${safe(x.reason)}</p>
             <small>Risk: ${safe(x.risk)}</small>
+            ${actionImpactHtml(x)}
           </div>
         </div>`
     )
@@ -661,6 +666,27 @@ function responsePanelHtml(i) {
       ${approveButton}
       <p class="safe-note">${safe(actions.note || 'Simulated recommendation only; no external action is available.')}</p>
     </article>`;
+}
+
+function actionImpactHtml(action) {
+  const impact = action.impact_assessment || {};
+  const affected = impact.affected_services || [];
+  const status = impact.status || 'incomplete';
+  return `<div class="finding-box"><div class="finding-label">SIMULATED IMPACT · ${safe(status.toUpperCase())}</div>
+    <p>Target: <strong>${safe(action.target_service || 'Unknown')}</strong> · Risk: <strong>${safe(impact.risk_level || 'Unknown')}</strong></p>
+    <p>Direct impact: ${safe((impact.direct_dependents || []).join(', ') || 'None identified')}<br>Indirect impact: ${safe((affected.filter(s => !(impact.direct_dependents || []).includes(s))).join(', ') || 'None identified')}</p>
+    <p>Affected services: ${safe(affected.join(', ') || 'Unknown')}</p><small>${safe(impact.evidence || 'Impact is unknown until a valid target is assessed.')}</small></div>`;
+}
+
+function causalPanelHtml(i) {
+  const result = causalResults[i.id];
+  if (!result) return '';
+  const chain = result.causal_chain;
+  const recovery = result.recovery_recommendation;
+  if (!chain && !recovery) return '';
+  return `<article class="panel"><div class="panel-heading"><div><span class="panel-index">08</span><h2>Possible causal relationship</h2></div></div>
+    <p>${safe(result.explanation || '')}</p>${chain ? `<ol>${chain.events.map(e => `<li>${safe(e.at || 'Timestamp unavailable')} — ${safe(e.label)} ${safe(e.action || e.service || '')}</li>`).join('')}</ol><p>Interval: ${safe(chain.delay_seconds)} seconds. Confidence: ${safe(chain.detector_confidence)}. ${safe(chain.limitations)}</p>` : ''}
+    ${recovery ? `<div class="finding-box"><strong>Recovery recommendation · separate approval required</strong><p>${safe(recovery.action)}</p><p>Benefit: ${safe(recovery.expected_benefit)}</p><p>Risks: ${safe(recovery.risks)}</p><p>Potentially affected: ${safe((recovery.affected_services || []).join(', '))}</p><small>${safe(recovery.rollback_information)} Simulated only; no rollback executed.</small><button class="button secondary full" id="approveRecovery">Approve simulated recovery recommendation</button></div>` : ''}</article>`;
 }
 
 /* Section 07 – Verification */
@@ -728,6 +754,7 @@ function renderDetail() {
         ${fixProposalPanelHtml(i)}
         ${blastRadiusPanelHtml(i)}
         ${timelinePanelHtml(i)}
+        ${causalPanelHtml(i)}
       </div>
       <aside class="detail-side">
         ${responsePanelHtml(i)}
@@ -736,10 +763,21 @@ function renderDetail() {
     </div>`;
 
   bindDetailActions(i);
+  if (!Object.hasOwn(causalResults, i.id)) {
+    causalResults[i.id] = null;
+    api(`/api/incidents/${encodeURIComponent(i.id)}/self-cause`).then(data => {
+      causalResults[i.id] = data.result || {};
+      if (selected?.id === i.id) renderDetail();
+    }).catch(() => { causalResults[i.id] = {}; });
+  }
 }
 
 /** Attach click handlers to the buttons inside the detail view. */
 function bindDetailActions(i) {
+  $('#approveRecovery')?.addEventListener('click', async () => {
+    try { await api(`/api/incidents/${encodeURIComponent(i.id)}/recovery/approve`, { method: 'POST', body: '{}' }); toast('Recovery approval recorded; no rollback executed'); }
+    catch (error) { toast(error.message); }
+  });
   // Approve simulated response
   $('#approveAction')?.addEventListener('click', async () => {
     try {
@@ -948,8 +986,34 @@ $('#dismissNotice').addEventListener('click', () => $('.notice').remove());
 // Open an incident when a table row is clicked
 $('#incidentRows').addEventListener('click', (e) => {
   const row = e.target.closest('.incident-row');
-  if (row) openIncident(row.dataset.id);
+  if (!row) return;
+
+  const deleteButton = e.target.closest('.row-delete');
+  if (deleteButton) {
+    e.preventDefault();
+    e.stopPropagation();
+    deleteIncident(row.dataset.id, deleteButton);
+    return;
+  }
+
+  openIncident(row.dataset.id);
 });
+
+async function deleteIncident(id, button) {
+  if (!window.confirm(`Delete incident ${id} and its saved workflow history? This cannot be undone.`)) return;
+
+  button.disabled = true;
+  try {
+    await api(`/api/incidents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    delete causalResults[id];
+    delete blastRadiusResults[id];
+    toast(`Incident ${id} deleted`);
+    await load();
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message);
+  }
+}
 
 // New incident dialog
 $('#newIncidentBtn').addEventListener('click', () => $('#newIncidentDialog').showModal());

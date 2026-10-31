@@ -234,3 +234,4 @@
 .risk-none {
     color: #22c55e;
 }
+.incident-row-actions{white-space:nowrap}.row-delete{border:1px solid transparent;background:transparent;color:#b87982;border-radius:5px;width:27px;height:27px;margin-left:6px;font-size:17px;line-height:1;cursor:pointer}.row-delete:hover{border-color:#63343d;background:#301b23;color:#ff9299}.row-delete:disabled{opacity:.5;cursor:wait}

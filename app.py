@@ -110,6 +110,32 @@ def approved_action_items(value):
     return []
 
 
+def assess_response_actions(value):
+    """Attach a simulated dependency assessment to every response proposal."""
+    actions = approved_action_items(value)
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            action = {"action": str(action)}
+            actions[index] = action
+        action.setdefault("action_id", f"ACTION-{index + 1}")
+        target = action.get("target_service")
+        try:
+            if not isinstance(target, str) or target.strip().lower() not in get_all_services():
+                raise ValueError("Target service is unknown or missing")
+            assessment = assess_blast_radius(target.strip().lower())
+            action["impact_assessment"] = {"status": "complete", **assessment,
+                "evidence": "Calculated from the local simulated service dependency map."}
+        except (ValueError, AttributeError):
+            action["impact_assessment"] = {"status": "incomplete", "target_service": target,
+                "affected_services": [], "risk_level": "Unknown",
+                "evidence": "No valid target service is available; impact is unknown."}
+    if isinstance(value, dict):
+        result = dict(value)
+        result["actions"] = actions
+        return result
+    return actions
+
+
 def run_self_cause_detection(db, new_incident_id):
 
     new_row = db.execute(
@@ -174,6 +200,16 @@ def run_self_cause_detection(db, new_incident_id):
             prior["blast_radius_assessment"] = json_value(
                 assessment_row["assessment_json"], {}
             )
+        # The detector uses the union of action assessments; each action retains
+        # its own evidence for approval and reporting.
+        action_items = approved_action_items(prior.get("actions"))
+        complete = [a.get("impact_assessment", {}) for a in action_items if isinstance(a, dict)]
+        if complete:
+            prior["blast_radius_assessment"] = {
+                "target_service": next((a.get("target_service") for a in action_items
+                                         if isinstance(a, dict) and a.get("target_service")), None),
+                "affected_services": sorted({s for a in complete for s in a.get("affected_services", [])}),
+            }
 
         prior_incidents.append(prior)
 
@@ -183,6 +219,32 @@ def run_self_cause_detection(db, new_incident_id):
         prior_incidents=prior_incidents,
         correlation_window_seconds=300
     )
+
+    if result.get("possible_self_cause") is True:
+        relationship = result.get("relationship", {})
+        original = next((p for p in prior_incidents if p.get("id") == relationship.get("original_incident_id")), {})
+        result["causal_chain"] = {
+            "status": "possible causal relationship",
+            "events": [
+                {"at": original.get("created_at"), "label": "Original incident", "incident_id": original.get("id")},
+                {"at": relationship.get("approved_at"), "label": "Human approved simulated action", "action": relationship.get("approved_action"), "target_service": relationship.get("action_target_service")},
+                {"at": new_incident.get("created_at"), "label": "Subsequent incident", "incident_id": new_incident_id, "service": relationship.get("affected_service")},
+            ],
+            "blast_radius": result.get("correlation", {}).get("blast_radius_services", []),
+            "delay_seconds": relationship.get("delay_seconds"),
+            "detector_confidence": result.get("confidence"),
+            "limitations": result.get("uncertainty"),
+        }
+        result["recovery_recommendation"] = {
+            "status": "pending_human_approval",
+            "action": f"Review the approved action targeting {relationship.get('action_target_service')} and consider a simulated reversal or safer alternative.",
+            "expected_benefit": "Could restore dependent service availability if the approved action contributed to the incident.",
+            "risks": "Reversal may restore the condition the original action was intended to contain.",
+            "affected_services": result.get("correlation", {}).get("blast_radius_services", []),
+            "rollback_information": "No rollback procedure is recorded; analyst review is required.",
+            "simulation_only": True,
+        }
+        event(db, new_incident_id, "Recovery Recommendation", "waiting_approval", result["recovery_recommendation"])
 
     # Save the detection result in the existing activity table.
     activity_status = (
@@ -198,6 +260,9 @@ def run_self_cause_detection(db, new_incident_id):
         activity_status,
         result
     )
+
+    if result.get("causal_chain"):
+        event(db, new_incident_id, "Causal Reconstruction", "completed", result["causal_chain"])
 
     # Add the result to the incident timeline.
     timeline = json_value(
@@ -259,8 +324,7 @@ def init_db():
                 analysis = analyze(item, findings)
                 triage_result = triage(item, analysis, findings)
                 fixes= propose_fixes(item, analysis, triage_result)
-                actions = recommend(item, analysis)
-                actions = recommend(item, analysis)
+                actions = assess_response_actions(recommend(item, analysis))
                 timeline = [{"at":created,"label":"Sample incident ingested","detail":"Synthetic event data"}]
                 db.execute("INSERT INTO incidents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
                   (item["id"], item["title"], item["description"], analysis["incident_type"], analysis["severity"], "Active", item["source"], item["asset"], created, json.dumps(item["events"]), json.dumps({"detection":detection,"investigation":findings,"analysis":analysis,"triage":triage_result,"fix_proposals":fixes}), json.dumps(actions), json.dumps(timeline)))
@@ -299,6 +363,21 @@ def incident(incident_id):
         row = db.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
     if not row: return jsonify({"error":"Incident not found"}), 404
     return jsonify(incident_dict(row))
+
+
+@app.delete("/api/incidents/<incident_id>")
+def delete_incident(incident_id):
+    """Delete an incident and its persisted workflow and impact records."""
+    with connect() as db:
+        row = db.execute("SELECT id FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "Incident not found"}), 404
+
+        db.execute("DELETE FROM activity WHERE incident_id = ?", (incident_id,))
+        db.execute("DELETE FROM blast_radius_assessments WHERE incident_id = ?", (incident_id,))
+        db.execute("DELETE FROM incidents WHERE id = ?", (incident_id,))
+
+    return jsonify({"ok": True, "deleted": True, "incident_id": incident_id})
 
 @app.get("/api/incidents/<incident_id>/self-cause")
 def get_self_cause_result(incident_id):
@@ -371,7 +450,7 @@ def create_incident():
     fixes = propose_fixes(sample, analysis, triage_result)
 
     # Step 6: Response Agent
-    actions = recommend(sample, analysis)
+    actions = assess_response_actions(recommend(sample, analysis))
 
     created = now(); timeline = [{"at":created,"label":"Sample incident ingested","detail":"User supplied simulated event data"}]
     with connect() as db:
@@ -399,23 +478,18 @@ def approve(incident_id):
                 "error": "Incident not found"
             }), 404
 
-        # Validate Blast Radius Assessment before approval
-        assessment = db.execute("""
-            SELECT id
-            FROM blast_radius_assessments
-            WHERE incident_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-        """, (incident_id,)).fetchone()
-
-        if not assessment:
+        recommended_actions = json_value(row["actions"], [])
+        action_list = approved_action_items(recommended_actions.get("actions") if isinstance(recommended_actions, dict) else recommended_actions)
+        if not action_list or any(
+            not isinstance(action, dict)
+            or not isinstance(action.get("impact_assessment"), dict)
+            or action["impact_assessment"].get("status") != "complete"
+            for action in action_list
+        ):
             return jsonify({
                 "ok": False,
-                "error": "Blast radius assessment required",
-                "message": (
-                    "Complete blast radius analysis "
-                    "before approving this response."
-                )
+                "error": "Complete impact assessment required",
+                "message": "Every proposed action must have a completed impact assessment before approval."
             }), 409
 
         # Check whether already approved
@@ -427,8 +501,7 @@ def approve(incident_id):
                 "message": "Response was already approved."
             })
 
-        recommended_actions = json_value(row["actions"], [])
-        approved_actions = approved_action_items(recommended_actions)
+        approved_actions = action_list
 
         # Record approval time
         approval_time = now()
@@ -472,6 +545,26 @@ def approve(incident_id):
         "status": "Completed",
         "message": "Simulated response approved successfully."
     })
+
+
+@app.post("/api/incidents/<incident_id>/recovery/approve")
+def approve_recovery(incident_id):
+    with connect() as db:
+        row = db.execute("SELECT id FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "Incident not found"}), 404
+        proposal = db.execute("""SELECT output FROM activity WHERE incident_id = ?
+            AND agent = 'Recovery Recommendation' ORDER BY id DESC LIMIT 1""", (incident_id,)).fetchone()
+        if not proposal:
+            return jsonify({"error": "No recovery recommendation is available for approval."}), 409
+        output = json_value(proposal["output"], {})
+        event(db, incident_id, "Recovery Approval", "completed", {
+            "approved_at": now(), "simulated_only": True,
+            "message": "Recovery recommendation approved in simulation; no rollback was executed.",
+            "recommendation": output,
+        })
+    return jsonify({"ok": True, "simulated": True,
+                    "message": "Recovery recommendation approval recorded; no rollback was executed."})
 
 @app.get("/api/incidents/<incident_id>/agent-statuses")
 def get_agent_statuses(incident_id):
